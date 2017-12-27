@@ -1,28 +1,26 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Threading;
-using System.Threading.Tasks;
-//using Mono.Unix;
-using dockerfile;
 using System.Text;
+using dockerfile;
 using static Metaparticle.Package.Util;
+using RuntimeConfig = Metaparticle.Runtime.Config;
 
 namespace Metaparticle.Package
 {
     public class Driver
     {
         private Config config;
-        private Metaparticle.Runtime.Config runtimeConfig;
+        private RuntimeConfig runtimeConfig;
 
-        public Driver(Config config, Metaparticle.Runtime.Config runtimeConfig) {
+        public Driver(Config config, RuntimeConfig runtimeConfig) {
             this.config = config;
             this.runtimeConfig = runtimeConfig;
         }
 
         private ImageBuilder getBuilder() {
-            switch (config.Builder) {
+            switch (config.Builder.ToLowerInvariant()) {
                 case "docker":
                     return new DockerBuilder();
                 case "aci":
@@ -36,11 +34,11 @@ namespace Metaparticle.Package
             if (runtimeConfig == null) {
                 return null;
             }
-            switch (runtimeConfig.Executor) {
+            switch (runtimeConfig.Executor.ToLowerInvariant()) {
                 case "docker":
                     return new DockerExecutor();
                 case "aci":
-                    return new AciExecutor();
+                    return new AciExecutor(runtimeConfig);
                 case "metaparticle":
                     return new MetaparticleExecutor();
                 default:
@@ -89,17 +87,7 @@ namespace Metaparticle.Package
                 var prog = proc.MainModule.FileName;
                 dir = Directory.GetParent(prog).FullName;
             }
-            var instructions = new List<Instruction>();
-            instructions.Add(new Instruction("FROM", "debian:9"));
-            instructions.Add(new Instruction("RUN", " apt-get update && apt-get -qq -y install libunwind8 libicu57 libssl1.0 liblttng-ust0 libcurl3 libuuid1 libkrb5-3 zlib1g"));
-            // TODO: lots of things here are constant, figure out how to cache for perf?
-            instructions.Add(new Instruction("COPY", string.Format("* /exe/", dir)));
-            instructions.Add(new Instruction("CMD", string.Format("/exe/{0} {1}", exe, getArgs(args))));
-
-            var df = new Dockerfile(instructions.ToArray(), new Comment[0]);
-            var dockerfilename = dir + "/Dockerfile";
-            File.WriteAllText(dockerfilename, df.Contents());
-
+            var dockerfilename = writeDockerfile(dir, exe, args, config);
             var builder = getBuilder();
 
             string imgName = (string.IsNullOrEmpty(config.Repository) ? exe : config.Repository);
@@ -123,6 +111,10 @@ namespace Metaparticle.Package
             }
 
             var exec = getExecutor();
+            if (exec.PublishRequired() && !config.Publish) {
+                Console.Error.WriteLine("Image publish is required, but image was not published. Set publish to true in the package config.");
+                return;
+            }
             var id = exec.Run(imgName, runtimeConfig);
 
             Console.CancelKeyPress += delegate {
@@ -130,6 +122,26 @@ namespace Metaparticle.Package
             };
 
             exec.Logs(id, Console.Out, Console.Error);
+        }
+
+        private string writeDockerfile(string dir, string exe, string[] args, Config config)
+        {
+            var dockerfilename = dir + "/Dockerfile";
+            if (!string.IsNullOrEmpty(config.Dockerfile)) {
+                File.Copy(config.Dockerfile, dockerfilename);
+                return dockerfilename;
+            }
+            var instructions = new List<Instruction>();
+            instructions.Add(new Instruction("FROM", "debian:9"));
+            instructions.Add(new Instruction("RUN", " apt-get update && apt-get -qq -y install libunwind8 libicu57 libssl1.0 liblttng-ust0 libcurl3 libuuid1 libkrb5-3 zlib1g"));
+            // TODO: lots of things here are constant, figure out how to cache for perf?
+            instructions.Add(new Instruction("COPY", string.Format("* /exe/", dir)));
+            instructions.Add(new Instruction("CMD", string.Format("/exe/{0} {1}", exe, getArgs(args))));
+
+            var df = new Dockerfile(instructions.ToArray(), new Comment[0]);
+            File.WriteAllText(dockerfilename, df.Contents());
+
+            return dockerfilename;
         }
 
         public static bool InDockerContainer()
@@ -160,7 +172,7 @@ namespace Metaparticle.Package
                 return;
             }
             Config config = new Config();
-            Metaparticle.Runtime.Config runtimeConfig = null;
+            RuntimeConfig runtimeConfig = null;
             var trace = new StackTrace();
             foreach (object attribute in trace.GetFrame(1).GetMethod().GetCustomAttributes(true))
             {
@@ -168,8 +180,8 @@ namespace Metaparticle.Package
                 {
                     config = (Config) attribute;
                 }
-                if (attribute is Metaparticle.Runtime.Config) {
-                    runtimeConfig = (Metaparticle.Runtime.Config) attribute;
+                if (attribute is RuntimeConfig) {
+                    runtimeConfig = (RuntimeConfig) attribute;
                 }
             }
             var mp = new Driver(config, runtimeConfig);
